@@ -28,6 +28,8 @@ def define_args(parser):
     parser.add_argument("--texturize", help="Add textures to mesh export (BETA)", action="store_true")
     parser.add_argument("--preview", help="Show latest primary image as a preview", action="store_true")
     parser.add_argument("--preview3d", help="Show 3D visualization", action="store_true")
+    parser.add_argument("--no_post_process_pcd", help="Post-process point cloud data", action="store_true")
+    parser.add_argument("--write_skipped_frames_txt", help="Write skipped frames to a text file", action="store_true")
     return parser
 
 def define_subparser(subparsers):
@@ -200,14 +202,17 @@ def convert_json_taichi_to_nerfstudio(d):
             by_camera[cam_id] = params
 
         converted = {
-            'file_path': os.path.join("./images", c['image_path'].split('/')[-1]),
+            'file_path': os.path.join("./results", c['image_path'].split('/')[-1]),
             "transform_matrix": transform_matrix_cam_to_world(c['T_pointcloud_camera']),
             "camera_linear_velocity": transform_camera_dir_vec(c['camera_linear_velocity']),
             "camera_angular_velocity": transform_camera_dir_vec(c['camera_angular_velocity']),
             "motion_blur_score": c["motion_blur_score"]
         }
         if 'depth_image_path' in c:
-            converted['depth_file_path'] = os.path.join("./images", c['depth_image_path'].split('/')[-1])
+            converted['depth_file_path'] = os.path.join("./results", c['depth_image_path'].split('/')[-1])
+
+        if 'pcd_path' in c:
+            converted['ply_file_path'] = c['pcd_path']
 
         by_camera[cam_id]['frames'].append(converted)
 
@@ -216,6 +221,7 @@ def convert_json_taichi_to_nerfstudio(d):
 
     key, value = list(by_camera.items())[0]
     return value
+    
 
 # TODO: don't use "Taichi" as the intermediate format
 def convert_json_taichi_to_colmap(pose_data, points_df, sparse_observations, nerfstudio_fake_obs=True):
@@ -333,6 +339,10 @@ def process(args):
             colored_point_cloud_df = point_cloud_df.loc[point_cloud_df[list('rgb')].max(axis=1) > 0].reset_index()
             colored_point_cloud_df['id'] = 0 # ID = 0 is not used for valid sparse map points
 
+            if args.no_post_process_pcd:
+                # If skipping the post-processing, use the dense point cloud
+                merged_df = colored_point_cloud_df
+
             filtered_point_cloud_df = exclude_points(colored_point_cloud_df, sparse_point_cloud_df, radius=args.cell_size)
             decimated_df = voxel_decimate(filtered_point_cloud_df, args.cell_size)
 
@@ -402,7 +412,7 @@ def process(args):
 
                 bgrImage = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                 if saveImages:
-                    fileName = f"{tmp_dir}/frame_{frameId:05}.{args.image_format}"
+                    fileName = f"{tmp_dir}/frame{frameId:06}.{args.image_format}"
                     cv2.imwrite(fileName, bgrImage)
 
                 # Find colors for sparse features
@@ -447,7 +457,7 @@ def process(args):
                     alignedDepth = frameSet.getAlignedDepthFrame(undistortedFrame)
                     depthData = alignedDepth.image.toArray()
                     if saveImages:
-                        depthFrameName = f"{tmp_dir}/depth_{frameId:05}.png"
+                        depthFrameName = f"{tmp_dir}/depth{frameId:06}.png"
                         cv2.imwrite(depthFrameName, depthData)
 
                     DEPTH_PREVIEW = False
@@ -490,9 +500,13 @@ def process(args):
             globalPointCloud = []
             index = 1 # start from 1 to match COLMAP/Nerfstudio frame numbering (fragile!)
             name = os.path.split(args.output)[-1]
+
+            skipped_frames = []
+
             for frameId in output.map.keyFrames:
                 if blurryImages.get(frameId):
                     print('skipping blurry frame %s' % str(frameId))
+                    skipped_frames.append(index)
                     continue # Skip blurry images
 
                 # Image and pose data
@@ -516,7 +530,7 @@ def process(args):
                 # Camera data
                 vCam, vAngCam = compute_cam_velocities(targetFrame, keyFrame.angularVelocity)
                 frame = {
-                    "image_path": f"data/{name}/images/frame_{index:05}.{args.image_format}",
+                    "image_path": f"data/{name}/results/frame{index:06}.{args.image_format}",
                     "T_pointcloud_camera": cameraPose.getCameraToWorldMatrix().tolist(), # 4x4 matrix, the transformation matrix from camera coordinate to point cloud coordinate
                     "camera_intrinsics": intrinsics.tolist(), # 3x3 matrix, the camera intrinsics matrix K
                     "camera_linear_velocity": vCam.tolist(),
@@ -532,15 +546,15 @@ def process(args):
                 if cameraDistortion is not None:
                     frame['camera_distortion'] = cameraDistortion
 
-                oldImgName = f"{tmp_dir}/frame_{frameId:05}.{args.image_format}"
-                newImgName = f"{args.output}/images/frame_{index:05}.{args.image_format}"
+                oldImgName = f"{tmp_dir}/frame{frameId:06}.{args.image_format}"
+                newImgName = f"{args.output}/results/frame{index:06}.{args.image_format}"
                 shutil.move(oldImgName, newImgName)
 
-                oldDepth = f"{tmp_dir}/depth_{frameId:05}.png"
-                newDepth = f"{args.output}/images/depth_{index:05}.png"
+                oldDepth = f"{tmp_dir}/depth{frameId:06}.png"
+                newDepth = f"{args.output}/results/depth{index:06}.png"
                 if os.path.exists(oldDepth):
                     shutil.move(oldDepth, newDepth)
-                    frame['depth_image_path'] = f"data/{name}/images/depth_{index:05}.png"
+                    frame['depth_image_path'] = f"data/{name}/results/depth{index:06}.png"
 
                 if (index + 3) % 7 == 0:
                     validationFrames.append(frame)
@@ -555,7 +569,20 @@ def process(args):
                     pc = np.hstack((pc, colorData))
                     globalPointCloud.extend(pc)
 
+                    # Save point cloud
+                    # if args.format in PC_AND_MESH_FORMATS:
+                    print("Shape: ", pc.shape)
+                    point_cloud_df = pd.DataFrame(pc, columns=list('xyzrgb'))
+                    ply_file_path = f"{args.output}/pcds/pcd{index:06}.ply"
+                    point_cloud_data_frame_to_ply(point_cloud_df, ply_file_path)
+                    frame['pcd_path'] = ply_file_path
+
                 index += 1
+
+            if args.write_skipped_frames_txt:
+                if len(skipped_frames) > 0:
+                    with open(f"{args.output}/skipped_frames.txt", "w") as outFile:
+                        outFile.write('\n'.join([str(f) for f in skipped_frames]))
 
             data = [list([pointId]) + list(point['position']) + list(point['color']) for pointId, point in sparsePointCloud.items()]
             sparse_point_cloud_df = pd.DataFrame(
@@ -582,6 +609,27 @@ def process(args):
                 allFrames = trainingFrames + validationFrames
                 with open(f"{args.output}/transforms.json", "w") as outFile:
                     json.dump(convert_json_taichi_to_nerfstudio(allFrames), outFile, indent=2, sort_keys=True)
+                    
+                import numpy
+                import re
+                    
+                # Save camera poses in file traj.txt where each line is a 4x4 matrix
+                with open(f"{args.output}/traj.txt", "w") as outFile:
+                    num_frames = len(allFrames)
+                    transformation_matrices = numpy.zeros((num_frames, 4, 4))
+                    for frame_id_lukas, frame in enumerate(allFrames):
+                        file_name = frame["image_path"]
+                        true_id = int(re.findall("\d+", file_name)[0]) - 1
+                        # frame_transformation_matrix = transform_matrix_cam_to_world(frame['T_pointcloud_camera'])
+                        frame_transformation_matrix = frame['T_pointcloud_camera']
+                        if frame_id_lukas == 0:
+                            print("trafo: ", frame_transformation_matrix)
+                        # Turn the 4x4 matrix into a list of 16 elements
+                        # and write it to the file
+                        transformation_matrices[true_id, ...] = frame_transformation_matrix
+
+                    for frame_transformation_matrix in transformation_matrices:
+                        outFile.write(' '.join([str(c) for row in frame_transformation_matrix for c in row]) + '\n') 
 
                 # colmap text point format
                 fake_colmap = f"{args.output}/colmap/sparse/0"
@@ -680,8 +728,8 @@ def process(args):
         parameter_sets.append('meshing')
     else:
         # Clear output dir
-        shutil.rmtree(f"{args.output}/images", ignore_errors=True)
-        os.makedirs(f"{args.output}/images", exist_ok=True)
+        shutil.rmtree(f"{args.output}/results", ignore_errors=True)
+        os.makedirs(f"{args.output}/results", exist_ok=True)
         tmp_dir = tempfile.mkdtemp()
 
     device_preset, cameras = parse_input_dir(args.input)
