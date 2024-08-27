@@ -342,6 +342,7 @@ def process(args):
             if args.no_post_process_pcd:
                 # If skipping the post-processing, use the dense point cloud
                 merged_df = colored_point_cloud_df
+                return merged_df
 
             filtered_point_cloud_df = exclude_points(colored_point_cloud_df, sparse_point_cloud_df, radius=args.cell_size)
             decimated_df = voxel_decimate(filtered_point_cloud_df, args.cell_size)
